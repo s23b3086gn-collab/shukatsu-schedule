@@ -340,6 +340,126 @@ ${text}
   };
 }
 
+/* ============================== 組織プロフィール調査（Gemini + Google検索） ============================== */
+// Google検索でグラウンディングして概要を取得する。検索が使えない場合はモデルの知識のみに
+// フォールバックし、その旨をgroundedフラグで区別する（推測と裏付けを混同させないため）。
+
+function stripJsonFence(raw) {
+  return String(raw).trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+}
+
+function buildProfilePrompt(org, type) {
+  const kind = type === "院試" ? "大学・大学院（研究科）" : "企業";
+  return `あなたは就職活動・大学院進学の情報整理を助けるアシスタントです。
+次の${kind}について、公開情報をもとに概要をまとめてください。
+
+対象: ${org}
+
+必ず次のキーだけを持つJSONオブジェクトのみを出力してください（前後に説明文やコードフェンスを付けない）。
+{
+  "summary": "どんな組織かの概要を日本語2〜3文で。事業内容や特徴が分かるように。",
+  "industry": "業種・分野（例：総合商社 / 情報科学）。不明なら空文字",
+  "location": "本社・キャンパスの所在地（例：東京都千代田区）。不明なら空文字",
+  "scale": "規模（例：従業員約1,200名 / 定員40名）。不明なら空文字",
+  "note": "就活・進学の観点で押さえておくとよい点を1〜2文。不明なら空文字",
+  "confidence": "high / medium / low のいずれか。対象を特定できた確信度",
+  "matchedName": "実際に情報源で確認できた正式名称。特定できなければ空文字"
+}
+
+重要な注意:
+- 推測で事実を作らないでください。確認できない項目は空文字にしてください。
+- 同名の別組織と取り違えた可能性がある場合は confidence を low にしてください。
+- 対象をまったく特定できない場合は summary を空文字、confidence を low にしてください。`;
+}
+
+async function requestGemini(apiKey, model, body) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  let res;
+  try {
+    res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal }
+    );
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e.name === "AbortError") throw new Error("タイムアウトしました");
+    throw new Error("ネットワークエラー：" + e.message);
+  }
+  clearTimeout(timeout);
+
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).error?.message || ""; } catch (e) { /* ignore */ }
+    const err = new Error(
+      res.status === 400 && /API key/i.test(detail) ? "APIキーが無効です" : `APIエラー（${res.status}）${detail ? "：" + detail : ""}`
+    );
+    err.status = res.status;
+    err.detail = detail;
+    throw err;
+  }
+  return res.json();
+}
+
+function parseProfileJson(json) {
+  const raw = json?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+  if (!raw.trim()) throw new Error("応答が空でした");
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stripJsonFence(raw));
+  } catch (e) {
+    // JSONで返らなかった場合は本文をそのまま概要として扱う
+    parsed = { summary: raw.trim().slice(0, 400), confidence: "low" };
+  }
+
+  const chunks = json?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const sources = [];
+  const seen = new Set();
+  chunks.forEach(c => {
+    const uri = c?.web?.uri;
+    if (!uri || seen.has(uri)) return;
+    seen.add(uri);
+    sources.push({ title: c.web.title || uri, uri });
+  });
+
+  return {
+    summary: (parsed.summary || "").trim(),
+    industry: (parsed.industry || "").trim(),
+    location: (parsed.location || "").trim(),
+    scale: (parsed.scale || "").trim(),
+    note: (parsed.note || "").trim(),
+    confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "low",
+    matchedName: (parsed.matchedName || "").trim(),
+    sources: sources.slice(0, 5),
+  };
+}
+
+async function callGeminiOrgProfile(org, type, apiKey, model) {
+  const prompt = buildProfilePrompt(org, type);
+  const base = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2 } };
+
+  // まずGoogle検索で裏付けを取りにいく
+  try {
+    const json = await requestGemini(apiKey, model, { ...base, tools: [{ google_search: {} }] });
+    const profile = parseProfileJson(json);
+    if (!profile.summary) throw new Error("この組織の情報は見つかりませんでした");
+    return { ...profile, grounded: profile.sources.length > 0, fetchedAt: todayISO() };
+  } catch (e) {
+    // 検索ツール非対応のモデル等では400が返るため、その場合のみ非グラウンディングで再試行
+    if (e.status !== 400) throw e;
+  }
+
+  const json = await requestGemini(apiKey, model, base);
+  const profile = parseProfileJson(json);
+  if (!profile.summary) throw new Error("この組織の情報は見つかりませんでした");
+  return { ...profile, sources: [], grounded: false, fetchedAt: todayISO() };
+}
+
 /* ============================== 小さなUI部品 ============================== */
 
 function TypeDot({ type, className = "" }) {
@@ -377,6 +497,80 @@ function RemainingBadge({ days, size = "sm" }) {
 
 function EmptyState({ text }) {
   return <div className="text-center text-sm text-slate-400 py-8 border border-dashed border-slate-300 rounded-lg">{text}</div>;
+}
+
+/* AIが調べた組織情報。誤りが混ざりうるので、裏付けの有無と出典を必ず併記する。 */
+function OrgProfileCard({ profile, org, onClear, onRefetch, busy }) {
+  if (!profile) return null;
+
+  const rows = [
+    ["業種・分野", profile.industry],
+    ["所在地", profile.location],
+    ["規模", profile.scale],
+  ].filter(([, v]) => v);
+
+  const nameMismatch = profile.matchedName && org && profile.matchedName !== org;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <span className="text-xs font-semibold text-slate-500">AIが調べた概要</span>
+        <div className="flex items-center gap-2">
+          {onRefetch && (
+            <button type="button" onClick={onRefetch} disabled={busy} className="text-xs text-slate-400 hover:text-slate-700 disabled:opacity-40">
+              {busy ? "取得中…" : "再取得"}
+            </button>
+          )}
+          {onClear && (
+            <button type="button" onClick={onClear} className="text-xs text-red-300 hover:text-red-500">削除</button>
+          )}
+        </div>
+      </div>
+
+      {profile.confidence === "low" && (
+        <div className="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded px-2 py-1 mb-2">
+          同名の別組織と取り違えている可能性があります。内容を確認してください。
+        </div>
+      )}
+      {nameMismatch && (
+        <div className="text-xs text-slate-500 mb-1.5">情報源で確認した名称：{profile.matchedName}</div>
+      )}
+
+      <p className="text-sm text-slate-700 whitespace-pre-wrap">{profile.summary}</p>
+
+      {rows.length > 0 && (
+        <dl className="mt-2 space-y-0.5">
+          {rows.map(([label, value]) => (
+            <div key={label} className="flex gap-2 text-xs">
+              <dt className="text-slate-400 shrink-0 w-16">{label}</dt>
+              <dd className="text-slate-600 min-w-0">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+
+      {profile.note && <p className="text-xs text-slate-500 mt-2 whitespace-pre-wrap">{profile.note}</p>}
+
+      {profile.sources.length > 0 ? (
+        <div className="mt-2.5 pt-2 border-t border-slate-200">
+          <div className="text-xs text-slate-400 mb-1">出典</div>
+          <ul className="space-y-0.5">
+            {profile.sources.map((s, i) => (
+              <li key={i} className="text-xs truncate">
+                <a href={s.uri} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">{s.title}</a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="mt-2.5 pt-2 border-t border-slate-200 text-xs text-orange-600">
+          Web検索による裏付けが取れていません。AIの記憶のみに基づくため、公式サイトで必ず確認してください。
+        </div>
+      )}
+
+      <div className="text-xs text-slate-300 mt-2">取得日：{profile.fetchedAt}</div>
+    </div>
+  );
 }
 
 /* ============================== ヘッダー ============================== */
@@ -836,9 +1030,27 @@ const inputCls = "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm fo
 
 /* ============================== 案件フォーム ============================== */
 
-function EntryForm({ initial, onSubmit, onCancel, submitLabel }) {
-  const [form, setForm] = useState(initial || { type: "就活", org: "", status: "検討中", priority: "併願", memo: "", url: "" });
+function EntryForm({ initial, onSubmit, onCancel, submitLabel, apiKey, model, onOpenSettings }) {
+  const [form, setForm] = useState(initial || { type: "就活", org: "", status: "検討中", priority: "併願", memo: "", url: "", profile: null });
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [lookupError, setLookupError] = useState("");
+
+  async function lookupOrg() {
+    const org = form.org.trim();
+    if (!org || lookupBusy) return;
+    setLookupBusy(true);
+    setLookupError("");
+    try {
+      const profile = await callGeminiOrgProfile(org, form.type, apiKey, model);
+      set("profile", profile);
+    } catch (e) {
+      setLookupError(e.message);
+    } finally {
+      setLookupBusy(false);
+    }
+  }
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); if (!form.org.trim()) return; onSubmit(form); }} className="space-y-3">
@@ -855,8 +1067,38 @@ function EntryForm({ initial, onSubmit, onCancel, submitLabel }) {
       </div>
       <div>
         <FieldLabel>組織名</FieldLabel>
-        <input required className={inputCls} value={form.org} onChange={(e) => set("org", e.target.value)} placeholder="例：株式会社〇〇 / 〇〇大学大学院" />
+        <div className="flex gap-2">
+          <input required className={inputCls} value={form.org} onChange={(e) => set("org", e.target.value)} placeholder="例：株式会社〇〇 / 〇〇大学大学院" />
+          <button
+            type="button"
+            onClick={lookupOrg}
+            disabled={!form.org.trim() || lookupBusy || !apiKey}
+            title={apiKey ? "この組織の概要をAIが調べます" : "Gemini APIキーの設定が必要です"}
+            className="shrink-0 px-3 rounded-lg border border-slate-300 text-slate-600 text-sm whitespace-nowrap disabled:opacity-40"
+          >
+            {lookupBusy ? "調査中…" : "調べる"}
+          </button>
+        </div>
+        {!apiKey && (
+          <div className="text-xs text-slate-400 mt-1">
+            概要の自動調査にはGemini APIキーが必要です。
+            {onOpenSettings && (
+              <button type="button" onClick={onOpenSettings} className="text-blue-500 hover:underline ml-1">設定を開く</button>
+            )}
+          </div>
+        )}
+        {lookupError && <div className="text-xs text-red-500 mt-1">{lookupError}</div>}
       </div>
+
+      {form.profile && (
+        <OrgProfileCard
+          profile={form.profile}
+          org={form.org.trim()}
+          busy={lookupBusy}
+          onRefetch={lookupOrg}
+          onClear={() => set("profile", null)}
+        />
+      )}
       <div className="grid grid-cols-2 gap-3">
         <div>
           <FieldLabel>ステータス</FieldLabel>
@@ -948,12 +1190,28 @@ function TaskForm({ initial, events, onSubmit, onCancel }) {
 
 /* ============================== 案件詳細モーダル ============================== */
 
-function EntryDetailModal({ entry, events, tasks, onClose, onUpdateEntry, onDeleteEntry, onAddEvent, onUpdateEvent, onDeleteEvent, onAddTask, onUpdateTask, onDeleteTask }) {
+function EntryDetailModal({ entry, events, tasks, onClose, onUpdateEntry, onDeleteEntry, onAddEvent, onUpdateEvent, onDeleteEvent, onAddTask, onUpdateTask, onDeleteTask, apiKey, model, onOpenSettings }) {
   const [editingEntry, setEditingEntry] = useState(false);
   const [eventFormOpen, setEventFormOpen] = useState(false);
   const [editingEventId, setEditingEventId] = useState(null);
   const [taskFormOpen, setTaskFormOpen] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState(null);
+  const [lookupBusy, setLookupBusy] = useState(false);
+  const [lookupError, setLookupError] = useState("");
+
+  async function lookupOrg() {
+    if (lookupBusy) return;
+    setLookupBusy(true);
+    setLookupError("");
+    try {
+      const profile = await callGeminiOrgProfile(entry.org, entry.type, apiKey, model);
+      onUpdateEntry(entry.id, { ...entry, profile });
+    } catch (e) {
+      setLookupError(e.message);
+    } finally {
+      setLookupBusy(false);
+    }
+  }
 
   const myEvents = events.filter(ev => ev.entryId === entry.id).sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
   const myTasks = tasks.filter(t => t.entryId === entry.id).sort((a, b) => (a.deadline > b.deadline ? 1 : -1));
@@ -966,6 +1224,9 @@ function EntryDetailModal({ entry, events, tasks, onClose, onUpdateEntry, onDele
           submitLabel="更新"
           onCancel={() => setEditingEntry(false)}
           onSubmit={(form) => { onUpdateEntry(entry.id, form); setEditingEntry(false); }}
+          apiKey={apiKey}
+          model={model}
+          onOpenSettings={onOpenSettings}
         />
       ) : (
         <div>
@@ -975,6 +1236,37 @@ function EntryDetailModal({ entry, events, tasks, onClose, onUpdateEntry, onDele
           <h2 className="text-lg font-bold text-slate-800 mt-2">{entry.org}</h2>
           {entry.url && <a href={entry.url} target="_blank" rel="noreferrer" className="text-xs text-blue-500 hover:underline break-all">{entry.url}</a>}
           {entry.memo && <p className="text-sm text-slate-500 mt-2 whitespace-pre-wrap">{entry.memo}</p>}
+
+          <div className="mt-3">
+            {entry.profile ? (
+              <OrgProfileCard
+                profile={entry.profile}
+                org={entry.org}
+                busy={lookupBusy}
+                onRefetch={lookupOrg}
+                onClear={() => onUpdateEntry(entry.id, { ...entry, profile: null })}
+              />
+            ) : (
+              <div>
+                <button
+                  onClick={lookupOrg}
+                  disabled={lookupBusy || !apiKey}
+                  title={apiKey ? "この組織の概要をAIが調べます" : "Gemini APIキーの設定が必要です"}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600 disabled:opacity-40"
+                >
+                  {lookupBusy ? "調査中…" : "どんな組織か調べる"}
+                </button>
+                {!apiKey && (
+                  <span className="text-xs text-slate-400 ml-2">
+                    Gemini APIキーが必要です。
+                    <button onClick={onOpenSettings} className="text-blue-500 hover:underline ml-1">設定を開く</button>
+                  </span>
+                )}
+              </div>
+            )}
+            {lookupError && <div className="text-xs text-red-500 mt-1">{lookupError}</div>}
+          </div>
+
           <div className="flex gap-2 mt-3">
             <button onClick={() => setEditingEntry(true)} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600">案件情報を編集</button>
             <button
@@ -1420,6 +1712,9 @@ function App() {
           <EntryForm
             onCancel={() => setManualFormOpen(false)}
             onSubmit={(form) => { addEntry(form); setManualFormOpen(false); }}
+            apiKey={geminiKey}
+            model={geminiModel}
+            onOpenSettings={() => { setManualFormOpen(false); setSettingsOpen(true); }}
           />
         </ModalShell>
       )}
@@ -1459,6 +1754,9 @@ function App() {
           onAddTask={addTask}
           onUpdateTask={updateTask}
           onDeleteTask={deleteTask}
+          apiKey={geminiKey}
+          model={geminiModel}
+          onOpenSettings={() => setSettingsOpen(true)}
         />
       )}
     </div>
