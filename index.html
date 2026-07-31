@@ -27,7 +27,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
 /* ============================== 定数 ============================== */
 
-const STORAGE_KEY = "shukatsu_inshi_schedule_v1";
+const STORAGE_KEY = "shukatsu_inshi_schedule_v2";
 const GEMINI_KEY_STORAGE = "shukatsu_inshi_gemini_api_key";
 const GEMINI_MODEL_STORAGE = "shukatsu_inshi_gemini_model";
 const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
@@ -123,48 +123,10 @@ function useLocalStorageState(key, initializer) {
   return [state, setState];
 }
 
-/* ============================== サンプルデータ ============================== */
+/* ============================== 初期データ ============================== */
 
-function shiftDate(daysFromToday, hhmm) {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + daysFromToday);
-  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
-  return hhmm ? `${y}-${m}-${day}T${hhmm}` : `${y}-${m}-${day}`;
-}
-
-function createSampleData() {
-  const e1 = uid("entry"), e2 = uid("entry"), e3 = uid("entry"), e4 = uid("entry");
-  const entries = [
-    { id: e1, type: "就活", org: "株式会社サンプル商事", status: "選考中", priority: "本命", memo: "OB訪問で聞いた話：一次面接はガクチカ重視。", url: "https://example.com/sample-shoji", createdAt: shiftDate(-20) },
-    { id: e2, type: "就活", org: "テック株式会社", status: "出願準備", priority: "併願", memo: "ES下書き途中。ポートフォリオを添付予定。", url: "https://example.com/tech-inc", createdAt: shiftDate(-10) },
-    { id: e3, type: "院試", org: "○○大学大学院 情報科学研究科", status: "出願準備", priority: "本命", memo: "研究計画書は指導教員に一度添削してもらう。", url: "https://example.com/grad-cs", createdAt: shiftDate(-30) },
-    { id: e4, type: "就活", org: "グローバル物流株式会社", status: "結果待ち", priority: "保険", memo: "最終面接終了。結果連絡は2週間以内とのこと。", url: "", createdAt: shiftDate(-45) },
-  ];
-
-  const events = [
-    { id: uid("ev"), entryId: e1, name: "一次面接", datetime: shiftDate(3, "10:00"), category: "面接", done: false },
-    { id: uid("ev"), entryId: e1, name: "ES提出締切", datetime: shiftDate(-5), category: "締切", done: true },
-
-    { id: uid("ev"), entryId: e2, name: "エントリーシート提出締切", datetime: shiftDate(6), category: "締切", done: false },
-    { id: uid("ev"), entryId: e2, name: "会社説明会", datetime: shiftDate(1, "14:00"), category: "説明会", done: false },
-
-    { id: uid("ev"), entryId: e3, name: "出願書類提出締切", datetime: shiftDate(14), category: "締切", done: false },
-    { id: uid("ev"), entryId: e3, name: "筆記試験", datetime: shiftDate(35, "09:30"), category: "試験", done: false },
-
-    { id: uid("ev"), entryId: e4, name: "最終面接", datetime: shiftDate(-8, "13:00"), category: "面接", done: true },
-    { id: uid("ev"), entryId: e4, name: "結果通知予定日", datetime: shiftDate(2), category: "締切", done: false },
-  ];
-
-  const tasks = [
-    { id: uid("task"), entryId: e1, eventId: events[0].id, content: "面接想定質問の回答を準備する", deadline: shiftDate(2), done: false },
-    { id: uid("task"), entryId: e2, eventId: events[2].id, content: "ESの自己PR欄を書き上げる", deadline: shiftDate(4), done: false },
-    { id: uid("task"), entryId: e2, eventId: "", content: "ポートフォリオサイトを更新する", deadline: shiftDate(5), done: false },
-    { id: uid("task"), entryId: e3, eventId: events[4].id, content: "研究計画書のドラフトを完成させる", deadline: shiftDate(7), done: false },
-    { id: uid("task"), entryId: e3, eventId: events[5].id, content: "過去問を1年分解く", deadline: shiftDate(-2), done: false },
-  ];
-
-  return { entries, events, tasks };
+function createInitialData() {
+  return { entries: [], events: [], tasks: [] };
 }
 
 /* ============================== 抽出（簡易パターンマッチ） ============================== */
@@ -1205,7 +1167,7 @@ function SettingsModal({ apiKey, model, onSave, onClose }) {
 /* ============================== ルートアプリ ============================== */
 
 function App() {
-  const [data, setData] = useLocalStorageState(STORAGE_KEY, createSampleData);
+  const [data, setData] = useLocalStorageState(STORAGE_KEY, createInitialData);
   const { entries, events, tasks } = data;
 
   const [tab, setTab] = useState("home");
