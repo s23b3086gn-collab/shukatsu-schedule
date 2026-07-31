@@ -28,6 +28,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 /* ============================== 定数 ============================== */
 
 const STORAGE_KEY = "shukatsu_inshi_schedule_v2";
+const LEGACY_STORAGE_KEY = "shukatsu_inshi_schedule_v1";
 const GEMINI_KEY_STORAGE = "shukatsu_inshi_gemini_api_key";
 const GEMINI_MODEL_STORAGE = "shukatsu_inshi_gemini_model";
 const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
@@ -109,24 +110,84 @@ const TONE_CLASS = {
   muted: "text-slate-400 bg-slate-50 border-slate-200",
 };
 
+// 保存に失敗した場合はsaveErrorに理由が入る（黙って消えるのを防ぐため画面に出す）。
 function useLocalStorageState(key, initializer) {
   const [state, setState] = useState(() => {
     try {
       const raw = window.localStorage.getItem(key);
-      if (raw) return JSON.parse(raw);
+      if (raw) return normalizeData(JSON.parse(raw));
     } catch (e) { /* 破損データは無視して初期化 */ }
     return initializer();
   });
+  const [saveError, setSaveError] = useState("");
+
   useEffect(() => {
-    try { window.localStorage.setItem(key, JSON.stringify(state)); } catch (e) { /* 保存失敗は静かに無視 */ }
+    try {
+      window.localStorage.setItem(key, JSON.stringify(state));
+      setSaveError("");
+    } catch (e) {
+      setSaveError(
+        e && e.name === "QuotaExceededError"
+          ? "保存容量が上限に達したため保存できませんでした"
+          : "この端末では保存できませんでした（プライベートモードの可能性があります）"
+      );
+    }
   }, [key, state]);
-  return [state, setState];
+
+  return [state, setState, saveError];
 }
 
-/* ============================== 初期データ ============================== */
+/* ============================== 初期データ / 旧データの引き継ぎ ============================== */
+
+function emptyData() {
+  return { entries: [], events: [], tasks: [] };
+}
+
+// v1で配布していたサンプル案件の署名（組織名＋メモの完全一致）。
+// 実データを誤って捨てないよう、両方一致した場合のみサンプルとみなす。
+const SAMPLE_SIGNATURES = [
+  ["株式会社サンプル商事", "OB訪問で聞いた話：一次面接はガクチカ重視。"],
+  ["テック株式会社", "ES下書き途中。ポートフォリオを添付予定。"],
+  ["○○大学大学院 情報科学研究科", "研究計画書は指導教員に一度添削してもらう。"],
+  ["グローバル物流株式会社", "最終面接終了。結果連絡は2週間以内とのこと。"],
+];
+
+function isSampleEntry(entry) {
+  return SAMPLE_SIGNATURES.some(([org, memo]) => entry.org === org && entry.memo === memo);
+}
+
+function normalizeData(raw) {
+  if (!raw || typeof raw !== "object") return emptyData();
+  return {
+    entries: Array.isArray(raw.entries) ? raw.entries : [],
+    events: Array.isArray(raw.events) ? raw.events : [],
+    tasks: Array.isArray(raw.tasks) ? raw.tasks : [],
+  };
+}
+
+// 保存キーをv1からv2へ変更した際に取り残された実データを引き継ぐ。
+// サンプル案件と、それに紐づくイベント・タスクだけを取り除く。
+function migrateLegacyData() {
+  let legacy;
+  try {
+    const raw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!raw) return emptyData();
+    legacy = normalizeData(JSON.parse(raw));
+  } catch (e) {
+    return emptyData();
+  }
+
+  const entries = legacy.entries.filter(e => !isSampleEntry(e));
+  const keptIds = new Set(entries.map(e => e.id));
+  return {
+    entries,
+    events: legacy.events.filter(ev => keptIds.has(ev.entryId)),
+    tasks: legacy.tasks.filter(t => keptIds.has(t.entryId)),
+  };
+}
 
 function createInitialData() {
-  return { entries: [], events: [], tasks: [] };
+  return migrateLegacyData();
 }
 
 /* ============================== 抽出（簡易パターンマッチ） ============================== */
@@ -1121,12 +1182,77 @@ function PasteExtractModal({ onClose, onConfirm, apiKey, model, onOpenSettings }
   );
 }
 
-function SettingsModal({ apiKey, model, onSave, onClose }) {
+function SettingsModal({ apiKey, model, onSave, onClose, data, onImportData }) {
   const [keyInput, setKeyInput] = useState(apiKey || "");
   const [modelInput, setModelInput] = useState(model || DEFAULT_GEMINI_MODEL);
+  const [importMsg, setImportMsg] = useState("");
+  const fileRef = useRef(null);
+
+  const counts = `案件${data.entries.length}件・イベント${data.events.length}件・タスク${data.tasks.length}件`;
+
+  function handleExport() {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `shukatsu-schedule-backup-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleImportFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = normalizeData(JSON.parse(String(reader.result)));
+      } catch (e) {
+        setImportMsg("読み込めませんでした（JSONとして不正です）");
+        return;
+      }
+      if (parsed.entries.length === 0 && parsed.events.length === 0 && parsed.tasks.length === 0) {
+        setImportMsg("読み込めませんでした（データが空です）");
+        return;
+      }
+      const ok = window.confirm(
+        `現在のデータ（${counts}）を、読み込むファイルの内容（案件${parsed.entries.length}件・イベント${parsed.events.length}件・タスク${parsed.tasks.length}件）で置き換えます。よろしいですか？`
+      );
+      if (!ok) return;
+      onImportData(parsed);
+      setImportMsg("読み込みました");
+    };
+    reader.onerror = () => setImportMsg("ファイルの読み込みに失敗しました");
+    reader.readAsText(file);
+  }
 
   return (
-    <ModalShell title="設定（Gemini API）" onClose={onClose}>
+    <ModalShell title="設定" onClose={onClose}>
+      <h4 className="text-sm font-bold text-slate-600 mb-2">バックアップ</h4>
+      <p className="text-xs text-slate-400 mb-3">
+        データはこの端末のブラウザ内にのみ保存されます。機種変更のときや、ブラウザの閲覧データ消去で失われるのを防ぐため、ときどき書き出しておくと安全です。
+      </p>
+      <div className="flex gap-2 flex-wrap">
+        <button onClick={handleExport} className="py-2 px-3 rounded-lg border border-slate-300 text-slate-600 text-sm">
+          バックアップを書き出す
+        </button>
+        <button onClick={() => fileRef.current && fileRef.current.click()} className="py-2 px-3 rounded-lg border border-slate-300 text-slate-600 text-sm">
+          バックアップを読み込む
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          onChange={(e) => { handleImportFile(e.target.files[0]); e.target.value = ""; }}
+        />
+      </div>
+      <div className="text-xs text-slate-400 mt-2">現在のデータ：{counts}</div>
+      {importMsg && <div className="text-xs text-slate-600 mt-1">{importMsg}</div>}
+
+      <hr className="my-4 border-slate-100" />
+
+      <h4 className="text-sm font-bold text-slate-600 mb-2">Gemini API</h4>
       <p className="text-xs text-slate-400 mb-3">
         Gemini APIキーを設定すると、「募集要項を貼り付け」の抽出精度が上がります。キーはこのブラウザのlocalStorageにのみ保存され、このHTMLファイル自体には書き込まれません。未設定の場合は簡易パターン抽出が使われます。
       </p>
@@ -1167,7 +1293,7 @@ function SettingsModal({ apiKey, model, onSave, onClose }) {
 /* ============================== ルートアプリ ============================== */
 
 function App() {
-  const [data, setData] = useLocalStorageState(STORAGE_KEY, createInitialData);
+  const [data, setData, saveError] = useLocalStorageState(STORAGE_KEY, createInitialData);
   const { entries, events, tasks } = data;
 
   const [tab, setTab] = useState("home");
@@ -1262,6 +1388,14 @@ function App() {
       <Header entries={entries} events={events} onOpenSettings={() => setSettingsOpen(true)} />
       <TabNav active={tab} onChange={setTab} />
 
+      {saveError && (
+        <div className="max-w-5xl mx-auto px-4 pt-4">
+          <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            ⚠ {saveError}。設定画面からバックアップを書き出してください。
+          </div>
+        </div>
+      )}
+
       {tab === "home" && <HomeView entries={entries} events={events} tasks={tasks} onToggleEvent={toggleEvent} onToggleTask={toggleTask} onOpenEntry={setOpenEntryId} />}
       {tab === "timeline" && <TimelineView entries={entries} events={events} onOpenEntry={setOpenEntryId} />}
       {tab === "stage" && <StageView entries={entries} events={events} onOpenEntry={setOpenEntryId} onChangeStatus={changeStatus} />}
@@ -1306,6 +1440,8 @@ function App() {
           model={geminiModel}
           onSave={saveGeminiSettings}
           onClose={() => setSettingsOpen(false)}
+          data={data}
+          onImportData={setData}
         />
       )}
 
