@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>就活・院試スケジュール管理</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
+  * { -webkit-font-smoothing: antialiased; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  @keyframes pulseSoft { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  .pulse-soft { animation: pulseSoft 2s ease-in-out infinite; }
+</style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ============================== 定数 ============================== */
+
+const STORAGE_KEY = "shukatsu_inshi_schedule_v1";
+const GEMINI_KEY_STORAGE = "shukatsu_inshi_gemini_api_key";
+const GEMINI_MODEL_STORAGE = "shukatsu_inshi_gemini_model";
+const DEFAULT_GEMINI_MODEL = "gemini-flash-latest";
+
+const TYPES = ["就活", "院試"];
+const STATUS_LIST = ["検討中", "出願準備", "出願済", "選考中", "結果待ち", "完了", "見送り"];
+const ACTIVE_STATUS = STATUS_LIST.filter(s => s !== "完了" && s !== "見送り");
+const PRIORITY_LIST = ["本命", "併願", "保険"];
+const EVENT_CATEGORIES = ["締切", "試験", "面接", "説明会"];
+const WEEKDAY_JP = ["日", "月", "火", "水", "木", "金", "土"];
+
+const TYPE_STYLE = {
+  "就活": { dot: "bg-blue-500", text: "text-blue-700", bg: "bg-blue-50", border: "border-blue-200", solid: "bg-blue-500" },
+  "院試": { dot: "bg-teal-500", text: "text-teal-700", bg: "bg-teal-50", border: "border-teal-200", solid: "bg-teal-500" },
+};
+
+/* ============================== ユーティリティ ============================== */
+
+let uidCounter = 0;
+function uid(prefix) {
+  uidCounter += 1;
+  return `${prefix}_${Date.now().toString(36)}_${uidCounter}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function todayDateOnly() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function todayISO() {
+  const d = new Date();
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// "YYYY-MM-DD" または "YYYY-MM-DDTHH:mm" の日付部分を取り出しローカルDate(時刻0時)にする
+function dateOnlyFromValue(value) {
+  if (!value) return null;
+  const datePart = value.split("T")[0];
+  const [y, m, d] = datePart.split("-").map(Number);
+  if (!y || !m || !d) return null;
+  return new Date(y, m - 1, d);
+}
+
+function diffDaysFromToday(value) {
+  const target = dateOnlyFromValue(value);
+  if (!target) return null;
+  const today = todayDateOnly();
+  return Math.round((target.getTime() - today.getTime()) / 86400000);
+}
+
+function formatDateJP(value, opts = {}) {
+  if (!value) return "";
+  const [datePart, timePart] = value.split("T");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const dateObj = new Date(y, m - 1, d);
+  const wd = WEEKDAY_JP[dateObj.getDay()];
+  const withYear = opts.withYear ? `${y}/` : "";
+  let str = `${withYear}${m}/${d}(${wd})`;
+  if (timePart && timePart !== "00:00") str += ` ${timePart}`;
+  return str;
+}
+
+function remainingLabel(days) {
+  if (days === null || days === undefined) return { text: "―", tone: "muted" };
+  if (days < 0) return { text: `期限切れ（${Math.abs(days)}日経過）`, tone: "overdue" };
+  if (days === 0) return { text: "本日締切", tone: "critical" };
+  if (days <= 3) return { text: `残り${days}日`, tone: "critical" };
+  if (days <= 7) return { text: `残り${days}日`, tone: "warning" };
+  return { text: `残り${days}日`, tone: "normal" };
+}
+
+const TONE_CLASS = {
+  overdue: "text-red-700 bg-red-50 border-red-200",
+  critical: "text-red-600 bg-red-50 border-red-200",
+  warning: "text-orange-500 bg-orange-50 border-orange-200",
+  normal: "text-slate-600 bg-slate-100 border-slate-200",
+  muted: "text-slate-400 bg-slate-50 border-slate-200",
+};
+
+function useLocalStorageState(key, initializer) {
+  const [state, setState] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw) return JSON.parse(raw);
+    } catch (e) { /* 破損データは無視して初期化 */ }
+    return initializer();
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem(key, JSON.stringify(state)); } catch (e) { /* 保存失敗は静かに無視 */ }
+  }, [key, state]);
+  return [state, setState];
+}
+
+/* ============================== サンプルデータ ============================== */
+
+function shiftDate(daysFromToday, hhmm) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + daysFromToday);
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
+  return hhmm ? `${y}-${m}-${day}T${hhmm}` : `${y}-${m}-${day}`;
+}
+
+function createSampleData() {
+  const e1 = uid("entry"), e2 = uid("entry"), e3 = uid("entry"), e4 = uid("entry");
+  const entries = [
+    { id: e1, type: "就活", org: "株式会社サンプル商事", status: "選考中", priority: "本命", memo: "OB訪問で聞いた話：一次面接はガクチカ重視。", url: "https://example.com/sample-shoji", createdAt: shiftDate(-20) },
+    { id: e2, type: "就活", org: "テック株式会社", status: "出願準備", priority: "併願", memo: "ES下書き途中。ポートフォリオを添付予定。", url: "https://example.com/tech-inc", createdAt: shiftDate(-10) },
+    { id: e3, type: "院試", org: "○○大学大学院 情報科学研究科", status: "出願準備", priority: "本命", memo: "研究計画書は指導教員に一度添削してもらう。", url: "https://example.com/grad-cs", createdAt: shiftDate(-30) },
+    { id: e4, type: "就活", org: "グローバル物流株式会社", status: "結果待ち", priority: "保険", memo: "最終面接終了。結果連絡は2週間以内とのこと。", url: "", createdAt: shiftDate(-45) },
+  ];
+
+  const events = [
+    { id: uid("ev"), entryId: e1, name: "一次面接", datetime: shiftDate(3, "10:00"), category: "面接", done: false },
+    { id: uid("ev"), entryId: e1, name: "ES提出締切", datetime: shiftDate(-5), category: "締切", done: true },
+
+    { id: uid("ev"), entryId: e2, name: "エントリーシート提出締切", datetime: shiftDate(6), category: "締切", done: false },
+    { id: uid("ev"), entryId: e2, name: "会社説明会", datetime: shiftDate(1, "14:00"), category: "説明会", done: false },
+
+    { id: uid("ev"), entryId: e3, name: "出願書類提出締切", datetime: shiftDate(14), category: "締切", done: false },
+    { id: uid("ev"), entryId: e3, name: "筆記試験", datetime: shiftDate(35, "09:30"), category: "試験", done: false },
+
+    { id: uid("ev"), entryId: e4, name: "最終面接", datetime: shiftDate(-8, "13:00"), category: "面接", done: true },
+    { id: uid("ev"), entryId: e4, name: "結果通知予定日", datetime: shiftDate(2), category: "締切", done: false },
+  ];
+
+  const tasks = [
+    { id: uid("task"), entryId: e1, eventId: events[0].id, content: "面接想定質問の回答を準備する", deadline: shiftDate(2), done: false },
+    { id: uid("task"), entryId: e2, eventId: events[2].id, content: "ESの自己PR欄を書き上げる", deadline: shiftDate(4), done: false },
+    { id: uid("task"), entryId: e2, eventId: "", content: "ポートフォリオサイトを更新する", deadline: shiftDate(5), done: false },
+    { id: uid("task"), entryId: e3, eventId: events[4].id, content: "研究計画書のドラフトを完成させる", deadline: shiftDate(7), done: false },
+    { id: uid("task"), entryId: e3, eventId: events[5].id, content: "過去問を1年分解く", deadline: shiftDate(-2), done: false },
+  ];
+
+  return { entries, events, tasks };
+}
+
+/* ============================== 抽出（簡易パターンマッチ） ============================== */
+// 注: 外部APIを呼ばず、テキスト中の日付・キーワードをパターンマッチで拾う簡易実装です。
+
+function inferYearForMonthDay(month, day) {
+  const now = new Date();
+  const candidateThisYear = new Date(now.getFullYear(), month - 1, day);
+  const cutoffPast = new Date(now); cutoffPast.setDate(cutoffPast.getDate() - 60);
+  if (candidateThisYear < cutoffPast) return now.getFullYear() + 1;
+  return now.getFullYear();
+}
+
+function findDateNear(text, keywordIndex, keywordLength) {
+  const windowText = text.slice(keywordIndex, Math.min(text.length, keywordIndex + keywordLength + 60));
+  const patterns = [
+    { re: /(\d{4})[年\/\-](\d{1,2})[月\/\-](\d{1,2})日?/, y: 1, m: 2, d: 3 },
+    { re: /(\d{1,2})月(\d{1,2})日/, y: null, m: 1, d: 2 },
+    { re: /(\d{1,2})\/(\d{1,2})(?!\d)/, y: null, m: 1, d: 2 },
+  ];
+  for (const p of patterns) {
+    const m = windowText.match(p.re);
+    if (m) {
+      const month = parseInt(m[p.m], 10);
+      const day = parseInt(m[p.d], 10);
+      if (month < 1 || month > 12 || day < 1 || day > 31) continue;
+      const year = p.y ? parseInt(m[p.y], 10) : inferYearForMonthDay(month, day);
+      const mm = String(month).padStart(2, "0"), dd = String(day).padStart(2, "0");
+      return `${year}-${mm}-${dd}`;
+    }
+  }
+  return "";
+}
+
+function extractFromText(text) {
+  const result = { org: "", deadline: "", examDate: "", docs: "", guessedType: "就活" };
+  if (!text || !text.trim()) return result;
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  const orgLine = lines.find(l => /(株式会社|合同会社|大学院|大学)/.test(l));
+  result.org = orgLine ? orgLine.replace(/^[■□◆●○\-\*\s]+/, "").slice(0, 60) : (lines[0] || "").slice(0, 60);
+  if (/大学院|大学/.test(result.org)) result.guessedType = "院試";
+
+  const deadlineIdx = text.search(/(応募締切|エントリー締切|出願締切|応募期限|提出期限|締め?切り?|応募期間)/);
+  if (deadlineIdx >= 0) {
+    const kw = text.match(/(応募締切|エントリー締切|出願締切|応募期限|提出期限|締め?切り?|応募期間)/);
+    result.deadline = findDateNear(text, deadlineIdx, kw[0].length);
+  }
+
+  const examIdx = text.search(/(試験日|選考日|一次試験|二次試験|筆記試験|面接日|選考会|面接選考)/);
+  if (examIdx >= 0) {
+    const kw = text.match(/(試験日|選考日|一次試験|二次試験|筆記試験|面接日|選考会|面接選考)/);
+    result.examDate = findDateNear(text, examIdx, kw[0].length);
+  }
+
+  const docsIdx = text.search(/(提出書類|必要書類|応募書類)/);
+  if (docsIdx >= 0) {
+    const afterIdx = text.indexOf("\n", docsIdx);
+    const chunk = afterIdx >= 0 ? text.slice(docsIdx, afterIdx + 120) : text.slice(docsIdx, docsIdx + 150);
+    result.docs = chunk.replace(/\s+/g, " ").trim().slice(0, 120);
+  }
+
+  return result;
+}
+
+/* ============================== Gemini API 抽出（任意） ============================== */
+// APIキーはlocalStorageにのみ保存され、ブラウザから直接Gemini APIへリクエストします。
+
+async function callGeminiExtract(text, apiKey, model) {
+  const schema = {
+    type: "OBJECT",
+    properties: {
+      org: { type: "STRING" },
+      type: { type: "STRING", enum: ["就活", "院試"] },
+      deadline: { type: "STRING" },
+      examDate: { type: "STRING" },
+      docs: { type: "STRING" },
+    },
+    required: ["org", "type", "deadline", "examDate", "docs"],
+  };
+
+  const prompt = `あなたは就職活動・大学院入試の募集要項からスケジュール情報を抽出するアシスタントです。今日の日付は ${todayISO()} です。
+以下のテキストを読み、次の項目をJSONで出力してください。
+
+- org: 組織名（企業名または大学院名。学部・研究科名まで含めてよい）
+- type: "就活" または "院試"
+- deadline: 出願・エントリーの締切日。"YYYY-MM-DD" 形式。年が省略されている場合は今日の日付を基準に妥当な年（今日以降で最も近い年）を推定する。読み取れない場合は空文字。
+- examDate: 試験日・面接日・選考日など。"YYYY-MM-DD" 形式。複数ある場合は最初のものを採用。読み取れない場合は空文字。
+- docs: 提出が必要な書類を簡潔な日本語でまとめる（例："エントリーシート、履歴書、成績証明書"）。読み取れない場合は空文字。
+
+テキスト:
+"""
+${text}
+"""`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+
+  let res;
+  try {
+    res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json",
+            responseSchema: schema,
+          },
+        }),
+        signal: controller.signal,
+      }
+    );
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e.name === "AbortError") throw new Error("タイムアウトしました");
+    throw new Error("ネットワークエラー：" + e.message);
+  }
+  clearTimeout(timeout);
+
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).error?.message || ""; } catch (e) { /* ignore */ }
+    if (res.status === 400 && /API key/i.test(detail)) throw new Error("APIキーが無効です");
+    throw new Error(`APIエラー（${res.status}）${detail ? "：" + detail : ""}`);
+  }
+
+  const json = await res.json();
+  const raw = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!raw) throw new Error("応答が空でした");
+
+  const cleaned = raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error("応答の解析に失敗しました");
+  }
+
+  return {
+    org: parsed.org || "",
+    guessedType: parsed.type === "院試" ? "院試" : "就活",
+    deadline: /^\d{4}-\d{2}-\d{2}$/.test(parsed.deadline) ? parsed.deadline : "",
+    examDate: /^\d{4}-\d{2}-\d{2}$/.test(parsed.examDate) ? parsed.examDate : "",
+    docs: parsed.docs || "",
+  };
+}
+
+/* ============================== 小さなUI部品 ============================== */
+
+function TypeDot({ type, className = "" }) {
+  const style = TYPE_STYLE[type] || TYPE_STYLE["就活"];
+  return <span className={`inline-block w-2.5 h-2.5 rounded-full ${style.dot} ${className}`}></span>;
+}
+
+function TypeBadge({ type }) {
+  const style = TYPE_STYLE[type] || TYPE_STYLE["就活"];
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${style.bg} ${style.text} border ${style.border}`}>
+      <TypeDot type={type} />{type}
+    </span>
+  );
+}
+
+function PriorityBadge({ priority }) {
+  const map = {
+    "本命": "bg-slate-800 text-white border-slate-800",
+    "併願": "bg-white text-slate-600 border-slate-300",
+    "保険": "bg-slate-50 text-slate-400 border-slate-200",
+  };
+  return <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium border ${map[priority] || map["併願"]}`}>{priority}</span>;
+}
+
+function StatusBadge({ status }) {
+  return <span className="inline-block px-2 py-0.5 rounded text-xs font-medium border border-slate-300 bg-white text-slate-600">{status}</span>;
+}
+
+function RemainingBadge({ days, size = "sm" }) {
+  const { text, tone } = remainingLabel(days);
+  const sizeClass = size === "lg" ? "text-sm px-2.5 py-1" : "text-xs px-2 py-0.5";
+  return <span className={`inline-block rounded border font-semibold ${sizeClass} ${TONE_CLASS[tone]}`}>{text}</span>;
+}
+
+function EmptyState({ text }) {
+  return <div className="text-center text-sm text-slate-400 py-8 border border-dashed border-slate-300 rounded-lg">{text}</div>;
+}
+
+/* ============================== ヘッダー ============================== */
+
+function computeNextDeadline(entries, events) {
+  const activeEntryIds = new Set(entries.filter(e => e.status !== "完了" && e.status !== "見送り").map(e => e.id));
+  const candidates = events
+    .filter(ev => !ev.done && activeEntryIds.has(ev.entryId))
+    .map(ev => ({ ev, days: diffDaysFromToday(ev.datetime), entry: entries.find(e => e.id === ev.entryId) }))
+    .filter(c => c.entry);
+
+  const upcoming = candidates.filter(c => c.days >= 0).sort((a, b) => a.days - b.days);
+  if (upcoming.length > 0) return upcoming[0];
+
+  const overdue = candidates.filter(c => c.days < 0).sort((a, b) => b.days - a.days);
+  if (overdue.length > 0) return overdue[0];
+
+  return null;
+}
+
+function Header({ entries, events, onOpenSettings }) {
+  const next = useMemo(() => computeNextDeadline(entries, events), [entries, events]);
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日(${WEEKDAY_JP[today.getDay()]})`;
+
+  let bigText, toneClass, sub;
+  if (!next) {
+    bigText = "予定なし"; toneClass = "text-slate-400"; sub = "登録済みの締切・予定はありません";
+  } else {
+    const { text, tone } = remainingLabel(next.days);
+    bigText = text;
+    toneClass = tone === "overdue" || tone === "critical" ? "text-red-600" : tone === "warning" ? "text-orange-500" : "text-slate-800";
+    sub = `${next.entry.org} ／ ${next.ev.name}（${formatDateJP(next.ev.datetime, { withYear: true })}）`;
+  }
+
+  return (
+    <div className="sticky top-0 z-30 bg-white border-b border-slate-200 shadow-sm">
+      <div className="max-w-5xl mx-auto px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-xs text-slate-400">{todayStr}</div>
+            <div className={`text-3xl sm:text-4xl font-bold leading-tight mt-0.5 ${toneClass} ${next && next.days <= 3 ? "pulse-soft" : ""}`}>
+              {bigText}
+            </div>
+            <div className="text-xs sm:text-sm text-slate-500 mt-1 truncate">{sub}</div>
+          </div>
+          <div className="flex flex-col items-end gap-2 shrink-0">
+            <button onClick={onOpenSettings} className="text-slate-300 hover:text-slate-600 text-lg leading-none" aria-label="設定" title="設定（Gemini API）">⚙</button>
+            {next && <TypeBadge type={next.entry.type} />}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== タブ ============================== */
+
+const TABS = [
+  { key: "home", label: "ホーム" },
+  { key: "timeline", label: "タイムライン" },
+  { key: "stage", label: "ステージ" },
+  { key: "list", label: "一覧" },
+];
+
+function TabNav({ active, onChange }) {
+  return (
+    <div className="sticky top-[72px] sm:top-[80px] z-20 bg-slate-100/95 backdrop-blur border-b border-slate-200">
+      <div className="max-w-5xl mx-auto px-2 sm:px-4 flex">
+        {TABS.map(t => (
+          <button
+            key={t.key}
+            onClick={() => onChange(t.key)}
+            className={`flex-1 sm:flex-none sm:px-6 py-3 text-sm font-medium border-b-2 transition-colors ${
+              active === t.key ? "border-slate-800 text-slate-900" : "border-transparent text-slate-400 hover:text-slate-600"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== ホームビュー ============================== */
+
+function HomeView({ entries, events, tasks, onToggleEvent, onToggleTask, onOpenEntry }) {
+  const activeEntryIds = useMemo(() => new Set(entries.filter(e => e.status !== "完了" && e.status !== "見送り").map(e => e.id)), [entries]);
+  const entryMap = useMemo(() => Object.fromEntries(entries.map(e => [e.id, e])), [entries]);
+
+  const checklist = useMemo(() => {
+    const items = [];
+    tasks.filter(t => !t.done && activeEntryIds.has(t.entryId)).forEach(t => {
+      const days = diffDaysFromToday(t.deadline);
+      if (days !== null && days <= 7) items.push({ kind: "task", id: t.id, label: t.content, date: t.deadline, days, entry: entryMap[t.entryId] });
+    });
+    events.filter(ev => !ev.done && ev.category === "締切" && activeEntryIds.has(ev.entryId)).forEach(ev => {
+      const days = diffDaysFromToday(ev.datetime);
+      if (days !== null && days <= 7) items.push({ kind: "event", id: ev.id, label: ev.name, date: ev.datetime, days, entry: entryMap[ev.entryId] });
+    });
+    items.sort((a, b) => a.days - b.days);
+    return items;
+  }, [tasks, events, activeEntryIds, entryMap]);
+
+  const overdueItems = checklist.filter(i => i.days < 0);
+  const upcomingItems = checklist.filter(i => i.days >= 0);
+
+  const entryCards = useMemo(() => {
+    return entries
+      .filter(e => activeEntryIds.has(e.id))
+      .map(e => {
+        const evs = events.filter(ev => ev.entryId === e.id && !ev.done)
+          .map(ev => ({ ...ev, days: diffDaysFromToday(ev.datetime) }))
+          .sort((a, b) => a.days - b.days);
+        return { entry: e, nextEvent: evs[0] || null };
+      })
+      .sort((a, b) => {
+        const da = a.nextEvent ? a.nextEvent.days : Infinity;
+        const db = b.nextEvent ? b.nextEvent.days : Infinity;
+        return da - db;
+      });
+  }, [entries, events, activeEntryIds]);
+
+  function ChecklistRow({ item }) {
+    const { text, tone } = remainingLabel(item.days);
+    return (
+      <label className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border ${TONE_CLASS[tone]} bg-white cursor-pointer`}>
+        <input
+          type="checkbox"
+          className="w-4 h-4 accent-slate-700 shrink-0"
+          checked={false}
+          onChange={() => item.kind === "task" ? onToggleTask(item.id) : onToggleEvent(item.id)}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-slate-800 truncate">{item.label}</div>
+          <div className="text-xs text-slate-400 truncate flex items-center gap-1.5 mt-0.5">
+            <TypeDot type={item.entry.type} />{item.entry.org} ・ {formatDateJP(item.date)}
+          </div>
+        </div>
+        <span className={`text-xs font-semibold whitespace-nowrap ${tone === "overdue" || tone === "critical" ? "text-red-600" : tone === "warning" ? "text-orange-500" : "text-slate-500"}`}>{text}</span>
+      </label>
+    );
+  }
+
+  return (
+    <div className="max-w-5xl mx-auto px-4 py-5 space-y-8">
+      {overdueItems.length > 0 && (
+        <section>
+          <h2 className="text-sm font-bold text-red-600 mb-2 flex items-center gap-1.5">⚠ 期限切れ（{overdueItems.length}件）</h2>
+          <div className="space-y-2">{overdueItems.map(i => <ChecklistRow key={i.kind + i.id} item={i} />)}</div>
+        </section>
+      )}
+
+      <section>
+        <h2 className="text-sm font-bold text-slate-600 mb-2">7日以内のタスク・締切</h2>
+        {upcomingItems.length === 0
+          ? <EmptyState text="7日以内の予定はありません" />
+          : <div className="space-y-2">{upcomingItems.map(i => <ChecklistRow key={i.kind + i.id} item={i} />)}</div>}
+      </section>
+
+      <section>
+        <h2 className="text-sm font-bold text-slate-600 mb-2">案件（締切が近い順）</h2>
+        {entryCards.length === 0 ? <EmptyState text="進行中の案件はありません" /> : (
+          <div className="grid sm:grid-cols-2 gap-3">
+            {entryCards.map(({ entry, nextEvent }) => {
+              const tone = nextEvent ? remainingLabel(nextEvent.days).tone : "muted";
+              const highlight = tone === "critical" || tone === "overdue";
+              return (
+                <button
+                  key={entry.id}
+                  onClick={() => onOpenEntry(entry.id)}
+                  className={`text-left p-4 rounded-xl border bg-white hover:shadow-md transition-shadow ${highlight ? "border-red-300 ring-1 ring-red-100" : "border-slate-200"}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <TypeBadge type={entry.type} />
+                    <StatusBadge status={entry.status} />
+                  </div>
+                  <div className="mt-2 font-semibold text-slate-800 truncate">{entry.org}</div>
+                  <div className="text-xs text-slate-500 mt-1 truncate">{nextEvent ? nextEvent.name : "次のイベント未登録"}</div>
+                  <div className="mt-2"><RemainingBadge days={nextEvent ? nextEvent.days : null} size="lg" /></div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/* ============================== タイムラインビュー ============================== */
+
+function TimelineView({ entries, events, onOpenEntry }) {
+  const DAY_W = 34;
+  const monthsToShow = 4;
+
+  const rangeStart = useMemo(() => {
+    const d = new Date(); d.setDate(1); d.setHours(0, 0, 0, 0);
+    return d;
+  }, []);
+  const rangeEnd = useMemo(() => {
+    const d = new Date(rangeStart);
+    d.setMonth(d.getMonth() + monthsToShow);
+    return d;
+  }, [rangeStart]);
+
+  const totalDays = Math.round((rangeEnd - rangeStart) / 86400000);
+  const totalWidth = totalDays * DAY_W;
+
+  function xForDate(d) {
+    return Math.round((d - rangeStart) / 86400000) * DAY_W;
+  }
+
+  const dayMarks = useMemo(() => {
+    const marks = [];
+    const cur = new Date(rangeStart);
+    while (cur < rangeEnd) {
+      marks.push({ date: new Date(cur), isMonthStart: cur.getDate() === 1 });
+      cur.setDate(cur.getDate() + 1);
+    }
+    return marks;
+  }, [rangeStart, rangeEnd]);
+
+  const rows = useMemo(() => {
+    return entries.map(entry => {
+      const evs = events.filter(ev => ev.entryId === entry.id).map(ev => dateOnlyFromValue(ev.datetime)).filter(Boolean);
+      if (evs.length === 0) return { entry, from: null, to: null, points: [] };
+      const from = new Date(Math.min(...evs.map(d => d.getTime())));
+      const to = new Date(Math.max(...evs.map(d => d.getTime())));
+      const points = events.filter(ev => ev.entryId === entry.id).map(ev => ({ ...ev, dateObj: dateOnlyFromValue(ev.datetime) })).filter(p => p.dateObj);
+      return { entry, from, to, points };
+    });
+  }, [entries, events]);
+
+  const todayX = xForDate(todayDateOnly());
+
+  return (
+    <div className="max-w-5xl mx-auto px-4 py-5">
+      <div className="flex items-center gap-4 mb-3 text-xs text-slate-500">
+        <span className="flex items-center gap-1.5"><TypeDot type="就活" />就活</span>
+        <span className="flex items-center gap-1.5"><TypeDot type="院試" />院試</span>
+        <span className="ml-auto">横にスクロールできます →</span>
+      </div>
+      <div className="border border-slate-200 rounded-xl bg-white overflow-x-auto no-scrollbar">
+        <div style={{ width: totalWidth + 160 }}>
+          <div className="flex sticky top-0 bg-white z-10 border-b border-slate-200">
+            <div className="w-40 shrink-0 border-r border-slate-200"></div>
+            <div className="relative" style={{ width: totalWidth, height: 32 }}>
+              {dayMarks.filter(m => m.isMonthStart).map((m, i) => (
+                <div key={i} className="absolute top-0 text-xs font-semibold text-slate-600 px-1" style={{ left: xForDate(m.date) }}>
+                  {m.date.getMonth() + 1}月
+                </div>
+              ))}
+            </div>
+          </div>
+          {rows.map(({ entry, from, to, points }) => {
+            const style = TYPE_STYLE[entry.type];
+            return (
+              <div key={entry.id} className="flex border-b border-slate-100 last:border-b-0">
+                <div className="w-40 shrink-0 border-r border-slate-200 px-2 py-3">
+                  <button onClick={() => onOpenEntry(entry.id)} className="text-left w-full">
+                    <div className="text-xs font-medium text-slate-700 truncate">{entry.org}</div>
+                    <div className="mt-1"><TypeBadge type={entry.type} /></div>
+                  </button>
+                </div>
+                <div className="relative" style={{ width: totalWidth, height: 56 }}>
+                  <div className="absolute top-0 bottom-0 w-px bg-red-200" style={{ left: todayX }}></div>
+                  {from && to && (
+                    <div
+                      className={`absolute top-5 h-2 rounded-full opacity-30 ${style.solid}`}
+                      style={{ left: xForDate(from), width: Math.max(DAY_W, xForDate(to) - xForDate(from) + DAY_W) }}
+                    ></div>
+                  )}
+                  {points.map(p => (
+                    <div key={p.id} className="absolute top-3 group" style={{ left: xForDate(p.dateObj) }}>
+                      <div className={`w-3 h-3 rounded-full border-2 border-white shadow ${p.done ? "bg-slate-300" : style.solid}`} title={`${p.name}（${p.category}）`}></div>
+                      <div className="hidden group-hover:block absolute z-20 top-5 left-1/2 -translate-x-1/2 whitespace-nowrap bg-slate-800 text-white text-xs px-2 py-1 rounded shadow">
+                        {p.name}（{formatDateJP(p.datetime)}）
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {rows.length === 0 && <div className="p-8"><EmptyState text="案件がありません" /></div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== ステージビュー（カンバン） ============================== */
+
+function StageView({ entries, events, onOpenEntry, onChangeStatus }) {
+  const [dragId, setDragId] = useState(null);
+  const [overCol, setOverCol] = useState(null);
+
+  const nextEventFor = useCallback((entryId) => {
+    const evs = events.filter(ev => ev.entryId === entryId && !ev.done)
+      .map(ev => ({ ...ev, days: diffDaysFromToday(ev.datetime) }))
+      .sort((a, b) => a.days - b.days);
+    return evs[0] || null;
+  }, [events]);
+
+  return (
+    <div className="max-w-5xl mx-auto px-4 py-5">
+      <div className="text-xs text-slate-400 mb-3">カードをドラッグするか、カード内のセレクトでステータスを変更できます</div>
+      <div className="flex gap-3 overflow-x-auto no-scrollbar pb-3">
+        {STATUS_LIST.map(status => {
+          const colEntries = entries.filter(e => e.status === status);
+          return (
+            <div
+              key={status}
+              onDragOver={(e) => { e.preventDefault(); setOverCol(status); }}
+              onDragLeave={() => setOverCol(null)}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (dragId) onChangeStatus(dragId, status);
+                setDragId(null); setOverCol(null);
+              }}
+              className={`w-64 shrink-0 rounded-xl border bg-slate-50/60 ${overCol === status ? "border-slate-400 bg-slate-100" : "border-slate-200"}`}
+            >
+              <div className="px-3 py-2 border-b border-slate-200 flex items-center justify-between">
+                <span className="text-sm font-semibold text-slate-700">{status}</span>
+                <span className="text-xs text-slate-400">{colEntries.length}</span>
+              </div>
+              <div className="p-2 space-y-2 min-h-[80px]">
+                {colEntries.map(entry => {
+                  const nextEv = nextEventFor(entry.id);
+                  return (
+                    <div
+                      key={entry.id}
+                      draggable
+                      onDragStart={() => setDragId(entry.id)}
+                      onDragEnd={() => setDragId(null)}
+                      className={`bg-white border border-slate-200 rounded-lg p-3 cursor-grab active:cursor-grabbing shadow-sm hover:shadow ${dragId === entry.id ? "opacity-40" : ""}`}
+                    >
+                      <button onClick={() => onOpenEntry(entry.id)} className="text-left w-full">
+                        <div className="flex items-center justify-between gap-1">
+                          <TypeBadge type={entry.type} />
+                          <PriorityBadge priority={entry.priority} />
+                        </div>
+                        <div className="text-sm font-semibold text-slate-800 mt-1.5 truncate">{entry.org}</div>
+                        {nextEv && (
+                          <div className="text-xs text-slate-500 mt-1 truncate">{nextEv.name}・{formatDateJP(nextEv.datetime)}</div>
+                        )}
+                        {nextEv && <div className="mt-1.5"><RemainingBadge days={nextEv.days} /></div>}
+                      </button>
+                      <select
+                        value={entry.status}
+                        onChange={(e) => onChangeStatus(entry.id, e.target.value)}
+                        className="mt-2 w-full text-xs border border-slate-200 rounded px-1.5 py-1 bg-slate-50"
+                      >
+                        {STATUS_LIST.map(s => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                    </div>
+                  );
+                })}
+                {colEntries.length === 0 && <div className="text-xs text-slate-300 text-center py-4">なし</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 一覧ビュー ============================== */
+
+function ListView({ entries, events, onOpenEntry, onAddEntry, onDeleteEntry }) {
+  const nextEventFor = useCallback((entryId) => {
+    const evs = events.filter(ev => ev.entryId === entryId && !ev.done)
+      .map(ev => ({ ...ev, days: diffDaysFromToday(ev.datetime) }))
+      .sort((a, b) => a.days - b.days);
+    return evs[0] || null;
+  }, [events]);
+
+  return (
+    <div className="max-w-5xl mx-auto px-4 py-5">
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="text-sm font-bold text-slate-600">全案件（{entries.length}件）</h2>
+        <button onClick={onAddEntry} className="text-sm px-3 py-1.5 rounded-lg bg-slate-800 text-white hover:bg-slate-700">+ 案件を追加</button>
+      </div>
+      <div className="border border-slate-200 rounded-xl bg-white overflow-x-auto">
+        <table className="w-full text-sm min-w-[640px]">
+          <thead>
+            <tr className="text-left text-xs text-slate-400 border-b border-slate-200">
+              <th className="px-3 py-2 font-medium">種別</th>
+              <th className="px-3 py-2 font-medium">組織名</th>
+              <th className="px-3 py-2 font-medium">ステータス</th>
+              <th className="px-3 py-2 font-medium">優先度</th>
+              <th className="px-3 py-2 font-medium">直近予定</th>
+              <th className="px-3 py-2 font-medium">残り</th>
+              <th className="px-3 py-2 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map(entry => {
+              const nextEv = nextEventFor(entry.id);
+              return (
+                <tr key={entry.id} className="border-b border-slate-100 last:border-b-0 hover:bg-slate-50">
+                  <td className="px-3 py-2.5"><TypeBadge type={entry.type} /></td>
+                  <td className="px-3 py-2.5 font-medium text-slate-800 max-w-[180px] truncate">
+                    <button onClick={() => onOpenEntry(entry.id)} className="hover:underline text-left">{entry.org}</button>
+                  </td>
+                  <td className="px-3 py-2.5"><StatusBadge status={entry.status} /></td>
+                  <td className="px-3 py-2.5"><PriorityBadge priority={entry.priority} /></td>
+                  <td className="px-3 py-2.5 text-slate-500 max-w-[160px] truncate">{nextEv ? nextEv.name : "―"}</td>
+                  <td className="px-3 py-2.5"><RemainingBadge days={nextEv ? nextEv.days : null} /></td>
+                  <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                    <button onClick={() => onOpenEntry(entry.id)} className="text-xs text-slate-500 hover:text-slate-800 px-2">編集</button>
+                    <button
+                      onClick={() => { if (window.confirm(`「${entry.org}」を削除しますか？関連するイベント・タスクも削除されます。`)) onDeleteEntry(entry.id); }}
+                      className="text-xs text-red-400 hover:text-red-600 px-2"
+                    >削除</button>
+                  </td>
+                </tr>
+              );
+            })}
+            {entries.length === 0 && (
+              <tr><td colSpan={7} className="py-8"><EmptyState text="案件がありません" /></td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== モーダル共通 ============================== */
+
+function ModalShell({ title, onClose, children, wide }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
+      <div
+        className={`bg-white w-full ${wide ? "sm:max-w-2xl" : "sm:max-w-md"} sm:rounded-2xl rounded-t-2xl max-h-[92vh] overflow-y-auto`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="sticky top-0 bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between z-10">
+          <h3 className="font-bold text-slate-800">{title}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-xl leading-none px-2">×</button>
+        </div>
+        <div className="p-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function FieldLabel({ children }) {
+  return <label className="block text-xs font-semibold text-slate-500 mb-1">{children}</label>;
+}
+
+const inputCls = "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-300";
+
+/* ============================== 案件フォーム ============================== */
+
+function EntryForm({ initial, onSubmit, onCancel, submitLabel }) {
+  const [form, setForm] = useState(initial || { type: "就活", org: "", status: "検討中", priority: "併願", memo: "", url: "" });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); if (!form.org.trim()) return; onSubmit(form); }} className="space-y-3">
+      <div>
+        <FieldLabel>種別</FieldLabel>
+        <div className="flex gap-2">
+          {TYPES.map(t => (
+            <button type="button" key={t} onClick={() => set("type", t)}
+              className={`flex-1 py-2 rounded-lg border text-sm font-medium ${form.type === t ? `${TYPE_STYLE[t].bg} ${TYPE_STYLE[t].text} ${TYPE_STYLE[t].border}` : "border-slate-200 text-slate-400"}`}>
+              {t}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <FieldLabel>組織名</FieldLabel>
+        <input required className={inputCls} value={form.org} onChange={(e) => set("org", e.target.value)} placeholder="例：株式会社〇〇 / 〇〇大学大学院" />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <FieldLabel>ステータス</FieldLabel>
+          <select className={inputCls} value={form.status} onChange={(e) => set("status", e.target.value)}>
+            {STATUS_LIST.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <FieldLabel>優先度</FieldLabel>
+          <select className={inputCls} value={form.priority} onChange={(e) => set("priority", e.target.value)}>
+            {PRIORITY_LIST.map(p => <option key={p} value={p}>{p}</option>)}
+          </select>
+        </div>
+      </div>
+      <div>
+        <FieldLabel>URL</FieldLabel>
+        <input className={inputCls} value={form.url} onChange={(e) => set("url", e.target.value)} placeholder="https://" />
+      </div>
+      <div>
+        <FieldLabel>メモ</FieldLabel>
+        <textarea className={inputCls} rows={3} value={form.memo} onChange={(e) => set("memo", e.target.value)} />
+      </div>
+      <div className="flex gap-2 pt-2">
+        <button type="button" onClick={onCancel} className="flex-1 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+        <button type="submit" className="flex-1 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium">{submitLabel || "保存"}</button>
+      </div>
+    </form>
+  );
+}
+
+/* ============================== イベント / タスク フォーム ============================== */
+
+function EventForm({ initial, onSubmit, onCancel }) {
+  const [form, setForm] = useState(initial || { name: "", datetime: "", category: "締切", done: false });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); if (!form.name.trim() || !form.datetime) return; onSubmit(form); }} className="space-y-3">
+      <div>
+        <FieldLabel>名称</FieldLabel>
+        <input required className={inputCls} value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="例：一次面接" />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <FieldLabel>区分</FieldLabel>
+          <select className={inputCls} value={form.category} onChange={(e) => set("category", e.target.value)}>
+            {EVENT_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div>
+          <FieldLabel>日時</FieldLabel>
+          <input required type="datetime-local" className={inputCls} value={form.datetime} onChange={(e) => set("datetime", e.target.value)} />
+        </div>
+      </div>
+      <div className="flex gap-2 pt-1">
+        <button type="button" onClick={onCancel} className="flex-1 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+        <button type="submit" className="flex-1 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium">保存</button>
+      </div>
+    </form>
+  );
+}
+
+function TaskForm({ initial, events, onSubmit, onCancel }) {
+  const [form, setForm] = useState(initial || { content: "", deadline: "", eventId: "", done: false });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); if (!form.content.trim() || !form.deadline) return; onSubmit(form); }} className="space-y-3">
+      <div>
+        <FieldLabel>内容</FieldLabel>
+        <input required className={inputCls} value={form.content} onChange={(e) => set("content", e.target.value)} placeholder="例：ESの自己PRを書く" />
+      </div>
+      <div>
+        <FieldLabel>期限</FieldLabel>
+        <input required type="date" className={inputCls} value={form.deadline} onChange={(e) => set("deadline", e.target.value)} />
+      </div>
+      <div>
+        <FieldLabel>紐づくイベント（任意）</FieldLabel>
+        <select className={inputCls} value={form.eventId} onChange={(e) => set("eventId", e.target.value)}>
+          <option value="">なし</option>
+          {events.map(ev => <option key={ev.id} value={ev.id}>{ev.name}（{formatDateJP(ev.datetime)}）</option>)}
+        </select>
+      </div>
+      <div className="flex gap-2 pt-1">
+        <button type="button" onClick={onCancel} className="flex-1 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+        <button type="submit" className="flex-1 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium">保存</button>
+      </div>
+    </form>
+  );
+}
+
+/* ============================== 案件詳細モーダル ============================== */
+
+function EntryDetailModal({ entry, events, tasks, onClose, onUpdateEntry, onDeleteEntry, onAddEvent, onUpdateEvent, onDeleteEvent, onAddTask, onUpdateTask, onDeleteTask }) {
+  const [editingEntry, setEditingEntry] = useState(false);
+  const [eventFormOpen, setEventFormOpen] = useState(false);
+  const [editingEventId, setEditingEventId] = useState(null);
+  const [taskFormOpen, setTaskFormOpen] = useState(false);
+  const [editingTaskId, setEditingTaskId] = useState(null);
+
+  const myEvents = events.filter(ev => ev.entryId === entry.id).sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  const myTasks = tasks.filter(t => t.entryId === entry.id).sort((a, b) => (a.deadline > b.deadline ? 1 : -1));
+
+  return (
+    <ModalShell title="案件の詳細" onClose={onClose} wide>
+      {editingEntry ? (
+        <EntryForm
+          initial={entry}
+          submitLabel="更新"
+          onCancel={() => setEditingEntry(false)}
+          onSubmit={(form) => { onUpdateEntry(entry.id, form); setEditingEntry(false); }}
+        />
+      ) : (
+        <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <TypeBadge type={entry.type} /><StatusBadge status={entry.status} /><PriorityBadge priority={entry.priority} />
+          </div>
+          <h2 className="text-lg font-bold text-slate-800 mt-2">{entry.org}</h2>
+          {entry.url && <a href={entry.url} target="_blank" rel="noreferrer" className="text-xs text-blue-500 hover:underline break-all">{entry.url}</a>}
+          {entry.memo && <p className="text-sm text-slate-500 mt-2 whitespace-pre-wrap">{entry.memo}</p>}
+          <div className="flex gap-2 mt-3">
+            <button onClick={() => setEditingEntry(true)} className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 text-slate-600">案件情報を編集</button>
+            <button
+              onClick={() => { if (window.confirm(`「${entry.org}」を削除しますか？関連するイベント・タスクも削除されます。`)) { onDeleteEntry(entry.id); onClose(); } }}
+              className="text-xs px-3 py-1.5 rounded-lg border border-red-200 text-red-500"
+            >削除</button>
+          </div>
+        </div>
+      )}
+
+      <hr className="my-4 border-slate-100" />
+
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-bold text-slate-600">イベント</h3>
+        <button onClick={() => { setEventFormOpen(v => !v); setEditingEventId(null); }} className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 text-white">+ 追加</button>
+      </div>
+      {eventFormOpen && (
+        <div className="mb-3 p-3 border border-slate-200 rounded-lg bg-slate-50">
+          <EventForm onCancel={() => setEventFormOpen(false)} onSubmit={(form) => { onAddEvent(entry.id, form); setEventFormOpen(false); }} />
+        </div>
+      )}
+      <div className="space-y-2">
+        {myEvents.map(ev => {
+          const days = diffDaysFromToday(ev.datetime);
+          return editingEventId === ev.id ? (
+            <div key={ev.id} className="p-3 border border-slate-200 rounded-lg bg-slate-50">
+              <EventForm initial={ev} onCancel={() => setEditingEventId(null)} onSubmit={(form) => { onUpdateEvent(ev.id, form); setEditingEventId(null); }} />
+            </div>
+          ) : (
+            <div key={ev.id} className={`flex items-center gap-3 p-2.5 rounded-lg border ${ev.done ? "border-slate-100 bg-slate-50" : "border-slate-200 bg-white"}`}>
+              <input type="checkbox" className="w-4 h-4 accent-slate-700 shrink-0" checked={ev.done} onChange={() => onUpdateEvent(ev.id, { ...ev, done: !ev.done })} />
+              <div className="min-w-0 flex-1">
+                <div className={`text-sm font-medium truncate ${ev.done ? "line-through text-slate-400" : "text-slate-800"}`}>{ev.name}</div>
+                <div className="text-xs text-slate-400 mt-0.5">{ev.category}・{formatDateJP(ev.datetime, { withYear: true })}</div>
+              </div>
+              {!ev.done && <RemainingBadge days={days} />}
+              <button onClick={() => { setEditingEventId(ev.id); setEventFormOpen(false); }} className="text-xs text-slate-400 hover:text-slate-700 px-1">編集</button>
+              <button onClick={() => onDeleteEvent(ev.id)} className="text-xs text-red-300 hover:text-red-500 px-1">削除</button>
+            </div>
+          );
+        })}
+        {myEvents.length === 0 && <div className="text-xs text-slate-300 text-center py-3">イベントはまだありません</div>}
+      </div>
+
+      <hr className="my-4 border-slate-100" />
+
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-bold text-slate-600">タスク</h3>
+        <button onClick={() => { setTaskFormOpen(v => !v); setEditingTaskId(null); }} className="text-xs px-2.5 py-1 rounded-lg bg-slate-800 text-white">+ 追加</button>
+      </div>
+      {taskFormOpen && (
+        <div className="mb-3 p-3 border border-slate-200 rounded-lg bg-slate-50">
+          <TaskForm events={myEvents} onCancel={() => setTaskFormOpen(false)} onSubmit={(form) => { onAddTask(entry.id, form); setTaskFormOpen(false); }} />
+        </div>
+      )}
+      <div className="space-y-2">
+        {myTasks.map(t => {
+          const days = diffDaysFromToday(t.deadline);
+          const linkedEvent = myEvents.find(ev => ev.id === t.eventId);
+          return editingTaskId === t.id ? (
+            <div key={t.id} className="p-3 border border-slate-200 rounded-lg bg-slate-50">
+              <TaskForm initial={t} events={myEvents} onCancel={() => setEditingTaskId(null)} onSubmit={(form) => { onUpdateTask(t.id, form); setEditingTaskId(null); }} />
+            </div>
+          ) : (
+            <div key={t.id} className={`flex items-center gap-3 p-2.5 rounded-lg border ${t.done ? "border-slate-100 bg-slate-50" : "border-slate-200 bg-white"}`}>
+              <input type="checkbox" className="w-4 h-4 accent-slate-700 shrink-0" checked={t.done} onChange={() => onUpdateTask(t.id, { ...t, done: !t.done })} />
+              <div className="min-w-0 flex-1">
+                <div className={`text-sm font-medium truncate ${t.done ? "line-through text-slate-400" : "text-slate-800"}`}>{t.content}</div>
+                <div className="text-xs text-slate-400 mt-0.5">{formatDateJP(t.deadline, { withYear: true })}{linkedEvent ? ` ・ ${linkedEvent.name}` : ""}</div>
+              </div>
+              {!t.done && <RemainingBadge days={days} />}
+              <button onClick={() => { setEditingTaskId(t.id); setTaskFormOpen(false); }} className="text-xs text-slate-400 hover:text-slate-700 px-1">編集</button>
+              <button onClick={() => onDeleteTask(t.id)} className="text-xs text-red-300 hover:text-red-500 px-1">削除</button>
+            </div>
+          );
+        })}
+        {myTasks.length === 0 && <div className="text-xs text-slate-300 text-center py-3">タスクはまだありません</div>}
+      </div>
+    </ModalShell>
+  );
+}
+
+/* ============================== 追加チューザー / 貼り付け抽出 ============================== */
+
+function AddChooserModal({ onClose, onPickManual, onPickPaste }) {
+  return (
+    <ModalShell title="案件を追加" onClose={onClose}>
+      <div className="space-y-3">
+        <button onClick={onPickManual} className="w-full text-left p-4 rounded-xl border border-slate-200 hover:border-slate-400 hover:bg-slate-50">
+          <div className="font-semibold text-slate-800 text-sm">手入力で追加</div>
+          <div className="text-xs text-slate-400 mt-1">組織名・ステータスなどをフォームに直接入力します</div>
+        </button>
+        <button onClick={onPickPaste} className="w-full text-left p-4 rounded-xl border border-slate-200 hover:border-slate-400 hover:bg-slate-50">
+          <div className="font-semibold text-slate-800 text-sm">募集要項を貼り付けて自動登録</div>
+          <div className="text-xs text-slate-400 mt-1">テキストから組織名・締切・試験日・提出書類を自動抽出します</div>
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function PasteExtractModal({ onClose, onConfirm, apiKey, model, onOpenSettings }) {
+  const [text, setText] = useState("");
+  const [parsed, setParsed] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [usedAi, setUsedAi] = useState(false);
+
+  async function handleExtract() {
+    setError("");
+    if (apiKey) {
+      setLoading(true);
+      try {
+        const r = await callGeminiExtract(text, apiKey, model);
+        setParsed({ type: r.guessedType, org: r.org, deadline: r.deadline, examDate: r.examDate, docs: r.docs, memo: text.trim().slice(0, 500) });
+        setUsedAi(true);
+        setLoading(false);
+        return;
+      } catch (e) {
+        setError(`Gemini APIでの抽出に失敗しました（${e.message}）。簡易抽出の結果を表示します。`);
+        setLoading(false);
+      }
+    }
+    const r = extractFromText(text);
+    setParsed({ type: r.guessedType, org: r.org, deadline: r.deadline, examDate: r.examDate, docs: r.docs, memo: text.trim().slice(0, 500) });
+    setUsedAi(false);
+  }
+
+  if (!parsed) {
+    return (
+      <ModalShell title="募集要項を貼り付け" onClose={onClose}>
+        <p className="text-xs text-slate-400 mb-2">
+          募集要項やメールの本文をそのまま貼り付けてください。組織名・出願締切・試験日・提出書類を抽出します。抽出結果は次の画面で必ず確認・修正してください。
+        </p>
+        {apiKey ? (
+          <p className="text-xs text-teal-600 mb-2">Gemini API（{model}）で抽出します。</p>
+        ) : (
+          <p className="text-xs text-slate-400 mb-2">
+            Gemini APIキーが未設定のため簡易パターン抽出を使用します。
+            <button type="button" onClick={onOpenSettings} className="text-blue-500 hover:underline ml-1">設定する</button>
+          </p>
+        )}
+        <textarea
+          className={inputCls + " min-h-[220px]"}
+          placeholder="ここに募集要項の文章を貼り付け…"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+        />
+        {error && <p className="text-xs text-red-500 mt-2">{error}</p>}
+        <div className="flex gap-2 pt-3">
+          <button onClick={onClose} className="flex-1 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+          <button onClick={handleExtract} disabled={!text.trim() || loading} className="flex-1 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium disabled:opacity-40">
+            {loading ? "抽出中…" : "抽出する"}
+          </button>
+        </div>
+      </ModalShell>
+    );
+  }
+
+  const set = (k, v) => setParsed(p => ({ ...p, [k]: v }));
+
+  return (
+    <ModalShell title="抽出結果を確認" onClose={onClose}>
+      <p className="text-xs text-slate-400 mb-3">
+        内容を確認・修正してから登録してください。{usedAi ? "（Gemini APIによる抽出結果）" : "（簡易パターン抽出の結果）"}
+      </p>
+      <div className="space-y-3">
+        <div>
+          <FieldLabel>種別</FieldLabel>
+          <div className="flex gap-2">
+            {TYPES.map(t => (
+              <button type="button" key={t} onClick={() => set("type", t)}
+                className={`flex-1 py-2 rounded-lg border text-sm font-medium ${parsed.type === t ? `${TYPE_STYLE[t].bg} ${TYPE_STYLE[t].text} ${TYPE_STYLE[t].border}` : "border-slate-200 text-slate-400"}`}>
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <FieldLabel>組織名</FieldLabel>
+          <input className={inputCls} value={parsed.org} onChange={(e) => set("org", e.target.value)} />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <FieldLabel>出願締切</FieldLabel>
+            <input type="date" className={inputCls} value={parsed.deadline} onChange={(e) => set("deadline", e.target.value)} />
+            {!parsed.deadline && <div className="text-xs text-orange-400 mt-1">検出できませんでした</div>}
+          </div>
+          <div>
+            <FieldLabel>試験日</FieldLabel>
+            <input type="date" className={inputCls} value={parsed.examDate} onChange={(e) => set("examDate", e.target.value)} />
+            {!parsed.examDate && <div className="text-xs text-orange-400 mt-1">検出できませんでした</div>}
+          </div>
+        </div>
+        <div>
+          <FieldLabel>提出書類</FieldLabel>
+          <input className={inputCls} value={parsed.docs} onChange={(e) => set("docs", e.target.value)} placeholder="例：ES、履歴書、成績証明書" />
+        </div>
+      </div>
+      <div className="flex gap-2 pt-4">
+        <button onClick={onClose} className="flex-1 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+        <button onClick={() => onConfirm(parsed)} disabled={!parsed.org.trim()} className="flex-1 py-2 rounded-lg bg-slate-800 text-white text-sm font-medium disabled:opacity-40">この内容で登録</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function SettingsModal({ apiKey, model, onSave, onClose }) {
+  const [keyInput, setKeyInput] = useState(apiKey || "");
+  const [modelInput, setModelInput] = useState(model || DEFAULT_GEMINI_MODEL);
+
+  return (
+    <ModalShell title="設定（Gemini API）" onClose={onClose}>
+      <p className="text-xs text-slate-400 mb-3">
+        Gemini APIキーを設定すると、「募集要項を貼り付け」の抽出精度が上がります。キーはこのブラウザのlocalStorageにのみ保存され、このHTMLファイル自体には書き込まれません。未設定の場合は簡易パターン抽出が使われます。
+      </p>
+      <div className="space-y-3">
+        <div>
+          <FieldLabel>Gemini APIキー</FieldLabel>
+          <input
+            type="password"
+            autoComplete="off"
+            className={inputCls}
+            value={keyInput}
+            onChange={(e) => setKeyInput(e.target.value)}
+            placeholder="AIza..."
+          />
+        </div>
+        <div>
+          <FieldLabel>モデル名</FieldLabel>
+          <input className={inputCls} value={modelInput} onChange={(e) => setModelInput(e.target.value)} placeholder={DEFAULT_GEMINI_MODEL} />
+          <div className="text-xs text-slate-400 mt-1">通常は変更不要です。</div>
+        </div>
+      </div>
+      <div className="flex gap-2 pt-4">
+        <button
+          onClick={() => { onSave("", DEFAULT_GEMINI_MODEL); onClose(); }}
+          className="text-xs text-red-400 hover:text-red-600 px-2"
+        >キーを削除</button>
+        <div className="flex-1"></div>
+        <button onClick={onClose} className="py-2 px-4 rounded-lg border border-slate-300 text-slate-600 text-sm">キャンセル</button>
+        <button
+          onClick={() => { onSave(keyInput.trim(), (modelInput || DEFAULT_GEMINI_MODEL).trim()); onClose(); }}
+          className="py-2 px-4 rounded-lg bg-slate-800 text-white text-sm font-medium"
+        >保存</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+/* ============================== ルートアプリ ============================== */
+
+function App() {
+  const [data, setData] = useLocalStorageState(STORAGE_KEY, createSampleData);
+  const { entries, events, tasks } = data;
+
+  const [tab, setTab] = useState("home");
+  const [openEntryId, setOpenEntryId] = useState(null);
+  const [addChooserOpen, setAddChooserOpen] = useState(false);
+  const [manualFormOpen, setManualFormOpen] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [geminiKey, setGeminiKey] = useState(() => { try { return window.localStorage.getItem(GEMINI_KEY_STORAGE) || ""; } catch (e) { return ""; } });
+  const [geminiModel, setGeminiModel] = useState(() => { try { return window.localStorage.getItem(GEMINI_MODEL_STORAGE) || DEFAULT_GEMINI_MODEL; } catch (e) { return DEFAULT_GEMINI_MODEL; } });
+
+  function saveGeminiSettings(key, model) {
+    setGeminiKey(key);
+    setGeminiModel(model);
+    try {
+      if (key) window.localStorage.setItem(GEMINI_KEY_STORAGE, key); else window.localStorage.removeItem(GEMINI_KEY_STORAGE);
+      window.localStorage.setItem(GEMINI_MODEL_STORAGE, model);
+    } catch (e) { /* 保存失敗は静かに無視 */ }
+  }
+
+  const updateData = (updater) => setData(prev => updater(prev));
+
+  function addEntry(form) {
+    const entry = { id: uid("entry"), ...form, createdAt: todayISO() };
+    updateData(prev => ({ ...prev, entries: [...prev.entries, entry] }));
+    return entry.id;
+  }
+  function updateEntry(id, form) {
+    updateData(prev => ({ ...prev, entries: prev.entries.map(e => e.id === id ? { ...e, ...form } : e) }));
+  }
+  function deleteEntry(id) {
+    updateData(prev => ({
+      entries: prev.entries.filter(e => e.id !== id),
+      events: prev.events.filter(ev => ev.entryId !== id),
+      tasks: prev.tasks.filter(t => t.entryId !== id),
+    }));
+  }
+  function changeStatus(id, status) {
+    updateEntry(id, { status });
+  }
+
+  function addEvent(entryId, form) {
+    updateData(prev => ({ ...prev, events: [...prev.events, { id: uid("ev"), entryId, ...form, done: false }] }));
+  }
+  function updateEvent(id, form) {
+    updateData(prev => ({ ...prev, events: prev.events.map(ev => ev.id === id ? { ...ev, ...form } : ev) }));
+  }
+  function deleteEvent(id) {
+    updateData(prev => ({
+      ...prev,
+      events: prev.events.filter(ev => ev.id !== id),
+      tasks: prev.tasks.map(t => t.eventId === id ? { ...t, eventId: "" } : t),
+    }));
+  }
+  function toggleEvent(id) {
+    updateData(prev => ({ ...prev, events: prev.events.map(ev => ev.id === id ? { ...ev, done: !ev.done } : ev) }));
+  }
+
+  function addTask(entryId, form) {
+    updateData(prev => ({ ...prev, tasks: [...prev.tasks, { id: uid("task"), entryId, ...form, done: false }] }));
+  }
+  function updateTask(id, form) {
+    updateData(prev => ({ ...prev, tasks: prev.tasks.map(t => t.id === id ? { ...t, ...form } : t) }));
+  }
+  function deleteTask(id) {
+    updateData(prev => ({ ...prev, tasks: prev.tasks.filter(t => t.id !== id) }));
+  }
+  function toggleTask(id) {
+    updateData(prev => ({ ...prev, tasks: prev.tasks.map(t => t.id === id ? { ...t, done: !t.done } : t) }));
+  }
+
+  function handlePasteConfirm(parsed) {
+    const entryId = addEntry({
+      type: parsed.type,
+      org: parsed.org || "(組織名未設定)",
+      status: "検討中",
+      priority: "併願",
+      memo: parsed.docs ? `【提出書類】${parsed.docs}\n\n${parsed.memo}` : parsed.memo,
+      url: "",
+    });
+    if (parsed.deadline) addEvent(entryId, { name: "出願締切", datetime: parsed.deadline, category: "締切" });
+    if (parsed.examDate) addEvent(entryId, { name: "試験日", datetime: parsed.examDate, category: "試験" });
+    if (parsed.docs && parsed.deadline) addTask(entryId, { content: `提出書類の準備（${parsed.docs}）`, deadline: parsed.deadline, eventId: "" });
+    setPasteOpen(false);
+    setOpenEntryId(entryId);
+  }
+
+  const openEntry = openEntryId ? entries.find(e => e.id === openEntryId) : null;
+
+  return (
+    <div className="min-h-screen pb-24">
+      <Header entries={entries} events={events} onOpenSettings={() => setSettingsOpen(true)} />
+      <TabNav active={tab} onChange={setTab} />
+
+      {tab === "home" && <HomeView entries={entries} events={events} tasks={tasks} onToggleEvent={toggleEvent} onToggleTask={toggleTask} onOpenEntry={setOpenEntryId} />}
+      {tab === "timeline" && <TimelineView entries={entries} events={events} onOpenEntry={setOpenEntryId} />}
+      {tab === "stage" && <StageView entries={entries} events={events} onOpenEntry={setOpenEntryId} onChangeStatus={changeStatus} />}
+      {tab === "list" && <ListView entries={entries} events={events} onOpenEntry={setOpenEntryId} onAddEntry={() => setAddChooserOpen(true)} onDeleteEntry={deleteEntry} />}
+
+      <button
+        onClick={() => setAddChooserOpen(true)}
+        className="fixed bottom-5 right-5 z-30 w-14 h-14 rounded-full bg-slate-800 text-white text-2xl shadow-lg hover:bg-slate-700 flex items-center justify-center"
+        aria-label="追加"
+      >＋</button>
+
+      {addChooserOpen && (
+        <AddChooserModal
+          onClose={() => setAddChooserOpen(false)}
+          onPickManual={() => { setAddChooserOpen(false); setManualFormOpen(true); }}
+          onPickPaste={() => { setAddChooserOpen(false); setPasteOpen(true); }}
+        />
+      )}
+
+      {manualFormOpen && (
+        <ModalShell title="案件を手入力で追加" onClose={() => setManualFormOpen(false)}>
+          <EntryForm
+            onCancel={() => setManualFormOpen(false)}
+            onSubmit={(form) => { addEntry(form); setManualFormOpen(false); }}
+          />
+        </ModalShell>
+      )}
+
+      {pasteOpen && (
+        <PasteExtractModal
+          onClose={() => setPasteOpen(false)}
+          onConfirm={handlePasteConfirm}
+          apiKey={geminiKey}
+          model={geminiModel}
+          onOpenSettings={() => { setPasteOpen(false); setSettingsOpen(true); }}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsModal
+          apiKey={geminiKey}
+          model={geminiModel}
+          onSave={saveGeminiSettings}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+
+      {openEntry && (
+        <EntryDetailModal
+          entry={openEntry}
+          events={events}
+          tasks={tasks}
+          onClose={() => setOpenEntryId(null)}
+          onUpdateEntry={updateEntry}
+          onDeleteEntry={deleteEntry}
+          onAddEvent={addEvent}
+          onUpdateEvent={updateEvent}
+          onDeleteEvent={deleteEvent}
+          onAddTask={addTask}
+          onUpdateTask={updateTask}
+          onDeleteTask={deleteTask}
+        />
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<script>
+(function () {
+  var source = document.getElementById("app-source").textContent;
+  var compiled = Babel.transform(source, { presets: [["react", { runtime: "classic" }]] }).code;
+  new Function(compiled)();
+})();
+</script>
+</body>
+</html>
