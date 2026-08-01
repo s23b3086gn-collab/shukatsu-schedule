@@ -376,9 +376,12 @@ function buildProfilePrompt(org, type) {
 - 対象をまったく特定できない場合は summary を空文字、confidence を low にしてください。`;
 }
 
-async function requestGemini(apiKey, model, body) {
+async function requestGemini(apiKey, model, body, signal) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
+  // 入力が変わったときに古いリクエストを打ち切れるようにする
+  if (signal) signal.addEventListener("abort", () => controller.abort(), { once: true });
+
   let res;
   try {
     res = await fetch(
@@ -387,7 +390,11 @@ async function requestGemini(apiKey, model, body) {
     );
   } catch (e) {
     clearTimeout(timeout);
-    if (e.name === "AbortError") throw new Error("タイムアウトしました");
+    if (e.name === "AbortError") {
+      const abortErr = new Error(signal && signal.aborted ? "中断しました" : "タイムアウトしました");
+      abortErr.aborted = true;
+      throw abortErr;
+    }
     throw new Error("ネットワークエラー：" + e.message);
   }
   clearTimeout(timeout);
@@ -395,9 +402,20 @@ async function requestGemini(apiKey, model, body) {
   if (!res.ok) {
     let detail = "";
     try { detail = (await res.json()).error?.message || ""; } catch (e) { /* ignore */ }
-    const err = new Error(
-      res.status === 400 && /API key/i.test(detail) ? "APIキーが無効です" : `APIエラー（${res.status}）${detail ? "：" + detail : ""}`
-    );
+
+    let message;
+    if (res.status === 400 && /API key/i.test(detail)) {
+      message = "APIキーが無効です";
+    } else if (res.status === 429) {
+      // 検索グラウンディングは通常の生成とは別枠で、無料枠がかなり少ない
+      message = body.tools
+        ? "Google検索の利用上限に達しました（検索なしで再取得します）"
+        : "APIの利用上限に達しました。しばらく待ってから試してください";
+    } else {
+      message = `APIエラー（${res.status}）${detail ? "：" + detail : ""}`;
+    }
+
+    const err = new Error(message);
     err.status = res.status;
     err.detail = detail;
     throw err;
@@ -450,8 +468,9 @@ async function callGeminiOrgProfile(org, type, apiKey, model) {
     if (!profile.summary) throw new Error("この組織の情報は見つかりませんでした");
     return { ...profile, grounded: profile.sources.length > 0, fetchedAt: todayISO() };
   } catch (e) {
-    // 検索ツール非対応のモデル等では400が返るため、その場合のみ非グラウンディングで再試行
-    if (e.status !== 400) throw e;
+    // 400（検索ツール非対応）と429（検索枠の上限）は、検索なしで取り直せば結果を返せる。
+    // それ以外のエラーは握りつぶさずそのまま伝える。
+    if (e.status !== 400 && e.status !== 429) throw e;
   }
 
   const json = await requestGemini(apiKey, model, base);
@@ -495,7 +514,8 @@ function buildNameCandidates(input, type, history) {
   }
 
   const univ = [];
-  if (!hasUniv) {
+  if (!hasUniv && !hasCorp) {
+    // 「株式会社〇〇大学」のような組み合わせは成り立たないので、会社形態が入っていれば出さない
     univ.push([`${base}大学`, "大学"]);
     univ.push([`${base}大学大学院`, "大学院"]);
   } else if (/大学$/.test(base)) {
@@ -511,58 +531,123 @@ function buildNameCandidates(input, type, history) {
   return out.slice(0, 8);
 }
 
-// 入力に一致する実在の組織名をGoogle検索経由で探す（キーがある場合のみ、明示操作で実行）。
-async function callGeminiOrgSuggest(query, type, apiKey, model) {
+// 入力途中の文字列から実在する組織名を補完する。
+// Google検索は使わない：検索枠は通常の生成と別枠でかなり少なく、入力のたびに呼ぶと
+// すぐ429になる。候補は利用者が目で選ぶものなので、裏付けは「調べる」側で取る。
+async function callGeminiOrgComplete(query, type, apiKey, model, signal) {
   const kind = type === "院試" ? "大学・大学院（研究科・専攻）" : "企業";
-  const prompt = `「${query}」で始まる、または「${query}」を含む実在の${kind}の正式名称を最大5件挙げてください。
+  const prompt = `日本の${kind}の名称を入力補完します。入力途中の文字列に一致する、実在する${kind}の正式名称を最大6件挙げてください。
+
+入力途中の文字列: 「${query}」
 
 必ず次の形式のJSON配列のみを出力してください（前後に説明文やコードフェンスを付けない）。
-[{"name": "正式名称", "hint": "所在地や分野など10文字程度の手がかり"}]
+[{"name": "正式名称", "hint": "業種や所在地など10文字程度の手がかり"}]
 
-注意:
-- 実在が確認できたものだけを挙げてください。存在しない名称を作らないでください。
-- 1件も確認できない場合は [] を返してください。`;
+規則:
+- 入力文字列が名称の一部（先頭・途中どちらでも）に含まれるものを挙げてください。
+- 「株式会社」「大学」などの語を入力が含む場合、その形式に合う正式名称を返してください。
+- 実在すると確信できるものだけを挙げてください。それらしい名称を作らないでください。
+- 心当たりがなければ [] を返してください。`;
 
-  const base = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } };
-
-  let json;
-  try {
-    json = await requestGemini(apiKey, model, { ...base, tools: [{ google_search: {} }] });
-  } catch (e) {
-    if (e.status !== 400) throw e;
-    json = await requestGemini(apiKey, model, base);
-  }
+  const json = await requestGemini(
+    apiKey,
+    model,
+    { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0 } },
+    signal
+  );
 
   const raw = json?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
   let parsed;
   try {
     parsed = JSON.parse(stripJsonFence(raw));
   } catch (e) {
-    throw new Error("候補の解析に失敗しました");
+    return [];
   }
   if (!Array.isArray(parsed)) return [];
 
   return parsed
     .filter(o => o && typeof o.name === "string" && o.name.trim())
-    .map(o => ({ value: o.name.trim(), hint: (o.hint || "").trim() || "AI候補" }))
-    .slice(0, 5);
+    .map(o => ({ value: o.name.trim(), hint: (o.hint || "").trim() || "候補" }))
+    .slice(0, 6);
 }
 
-/* 組織名の入力欄。入力に応じて候補を出し、タップ／キーボードで選べる。 */
+/* 組織名の入力欄。打っている途中で実在名の候補を出し、タップ／キーボードで選べる。 */
+const COMPLETE_DEBOUNCE_MS = 550;
+const COMPLETE_MIN_CHARS = 2;
+const RATE_LIMIT_COOLDOWN_MS = 60000;
+
 function OrgNameInput({ value, onChange, type, history, apiKey, model }) {
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(-1);
   const [aiItems, setAiItems] = useState([]);
   const [aiBusy, setAiBusy] = useState(false);
-  const [aiError, setAiError] = useState("");
+  const [aiNotice, setAiNotice] = useState("");
+
+  const cacheRef = useRef(new Map());
+  const abortRef = useRef(null);
+  const seqRef = useRef(0);
+  const skipNextRef = useRef(false);
+  const cooldownRef = useRef(0);
 
   const patternItems = useMemo(
     () => buildNameCandidates(value, type, history),
     [value, type, history]
   );
 
-  // 入力が変われば前回のAI候補は無効になる
-  useEffect(() => { setAiItems([]); setAiError(""); }, [value]);
+  // 入力が止まったら実在名を補完する
+  useEffect(() => {
+    const query = value.trim();
+
+    if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; }
+
+    // 候補を選んだ直後は、その値でまた問い合わせない
+    if (skipNextRef.current) { skipNextRef.current = false; return; }
+
+    if (!apiKey || query.length < COMPLETE_MIN_CHARS) {
+      setAiItems([]); setAiNotice(""); setAiBusy(false);
+      return;
+    }
+
+    const cacheKey = `${type} ${query}`;
+    if (cacheRef.current.has(cacheKey)) {
+      setAiItems(cacheRef.current.get(cacheKey));
+      setAiNotice(""); setAiBusy(false);
+      return;
+    }
+
+    if (Date.now() < cooldownRef.current) {
+      setAiItems([]); setAiBusy(false);
+      setAiNotice("APIの利用上限に達したため、名称の自動補完を一時停止しています");
+      return;
+    }
+
+    const mySeq = ++seqRef.current;
+    const timer = setTimeout(async () => {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setAiBusy(true);
+      setAiNotice("");
+      try {
+        const found = await callGeminiOrgComplete(query, type, apiKey, model, controller.signal);
+        if (mySeq !== seqRef.current) return; // 古い応答は捨てる
+        cacheRef.current.set(cacheKey, found);
+        setAiItems(found);
+      } catch (e) {
+        if (mySeq !== seqRef.current || e.aborted) return;
+        setAiItems([]);
+        if (e.status === 429) {
+          cooldownRef.current = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          setAiNotice("APIの利用上限に達したため、名称の自動補完を一時停止しています");
+        } else {
+          setAiNotice(e.message);
+        }
+      } finally {
+        if (mySeq === seqRef.current) setAiBusy(false);
+      }
+    }, COMPLETE_DEBOUNCE_MS);
+
+    return () => clearTimeout(timer);
+  }, [value, type, apiKey, model]);
 
   const items = useMemo(() => {
     const merged = [...aiItems];
@@ -572,28 +657,13 @@ function OrgNameInput({ value, onChange, type, history, apiKey, model }) {
 
   useEffect(() => { setHighlight(-1); }, [items.length]);
 
-  const showList = open && (items.length > 0 || aiBusy || aiError);
+  const showList = open && (items.length > 0 || aiBusy || aiNotice);
 
   function choose(item) {
+    skipNextRef.current = true;
     onChange(item.value);
     setOpen(false);
     setHighlight(-1);
-  }
-
-  async function fetchAiCandidates() {
-    const q = value.trim();
-    if (!q || aiBusy) return;
-    setAiBusy(true);
-    setAiError("");
-    try {
-      const found = await callGeminiOrgSuggest(q, type, apiKey, model);
-      if (found.length === 0) setAiError("一致する組織が見つかりませんでした");
-      setAiItems(found);
-    } catch (e) {
-      setAiError(e.message);
-    } finally {
-      setAiBusy(false);
-    }
   }
 
   function handleKeyDown(e) {
@@ -650,18 +720,8 @@ function OrgNameInput({ value, onChange, type, history, apiKey, model }) {
             ))}
           </ul>
 
-          {aiBusy && <div className="px-3 py-2 text-xs text-slate-400 border-t border-slate-100">正式名称を検索中…</div>}
-          {aiError && <div className="px-3 py-2 text-xs text-orange-600 border-t border-slate-100">{aiError}</div>}
-
-          {apiKey && value.trim() && !aiBusy && (
-            <button
-              type="button"
-              onClick={fetchAiCandidates}
-              className="w-full text-left px-3 py-2 text-xs text-blue-500 hover:bg-slate-50 border-t border-slate-100"
-            >
-              AIで実在する正式名称を探す
-            </button>
-          )}
+          {aiBusy && <div className="px-3 py-2 text-xs text-slate-400 border-t border-slate-100">候補を検索中…</div>}
+          {aiNotice && <div className="px-3 py-2 text-xs text-orange-600 border-t border-slate-100">{aiNotice}</div>}
         </div>
       )}
     </div>
